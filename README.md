@@ -28,7 +28,7 @@ sudo dnf install binutils python3-pip python3-requests python3-keyring git libap
 ```
 Arch Linux:
 ```
-sudo pacman -S binutils wget curl git python-pip python-requests python-gobject python-keyring libappindicator-gtk3 usbmuxd libimobiledevice avahi zlib unzip usbutils psmisc libhandy
+sudo pacman -S binutils wget curl git python-pip python-requests python-gobject python-keyring libappindicator-gtk3 usbmuxd libimobiledevice avahi zlib unzip usbutils psmisc libhandy libnotify
 ```
 
 OpenSUSE:
