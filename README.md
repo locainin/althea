@@ -61,7 +61,7 @@ That's it! Have fun with althea!
 
 You can downgrade crypto policies to the previous Fedora version:
 
-`sudo update-crypto-policies --set FEDORA40`
+`sudo update-crypto-policies --set LEGACY`
 
 ## Credits
 
