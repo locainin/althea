@@ -161,7 +161,7 @@ def on_abtdlg(self):
     about.destroy()
 
 def paircheck():  # Check if the device is paired already
-    pairchecking = subprocess.run('idevicepair pair | grep -q "SUCCESS"', shell=True)
+    pairchecking = subprocess.run('idevicepair validate | grep -q "SUCCESS"', shell=True) # use validate instaed of pair, pair causes error -5 if already paired
     if pairchecking.returncode == 0:
         return False
     else:
