@@ -1,18 +1,19 @@
 #!/usr/bin/python
-import os
 import errno
-from shutil import rmtree
-import json
-import urllib.request
-from urllib.request import urlopen
-import urllib.parse
-import requests
-import subprocess
-import signal
-import threading
-import keyring
-from time import sleep
+import os
 import platform
+import socket
+import signal
+import subprocess
+import sys
+import threading
+import urllib.request
+from shutil import rmtree
+from time import sleep
+from urllib.request import urlopen
+
+import keyring
+import requests
 from packaging import version
 
 # PyGObject
@@ -35,30 +36,23 @@ from gi.repository import Gdk
 
 GObject.type_ensure(Handy.ActionRow)
 
-installedcheck = False
+APP_NAME = "althea"
+ANISETTE_SERVER_URL = "http://127.0.0.1:6969"
 computer_cpu_platform = platform.machine()
+installedcheck = os.path.exists("/usr/lib/althea/althea")
+
 
 def resource_path(relative_path):
-    global installedcheck
-    CheckRun10 = subprocess.run(
-        f"find /usr/lib/althea/althea > /dev/null 2>&1", shell=True
-    )
-    if CheckRun10.returncode == 0:
-        installedcheck = True
-        base_path = "/usr/lib/althea"
-    else:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-    installedcheck = subprocess.run("test -e /usr/lib/althea/althea", shell=True).returncode == 0
+    # Pick the packaged path first so the same code works for both source and installed runs
     base_path = "/usr/lib/althea" if installedcheck else os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 
 # Global variables
 ipa_path_exists = False
 savedcheck = False
 InsAltStore = subprocess.Popen(
-    "test", stdin=subprocess.PIPE, stdout=subprocess.PIPE, shell=True
+    ["test"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
 )
 login_or_file_chooser = "login"
 apple_id = "lol"
@@ -67,30 +61,108 @@ Warnmsg = "warn"
 Failmsg = "fail"
 icon_name = "changes-prevent-symbolic"
 command_six = Gtk.CheckMenuItem(label="Launch at Login")
-AltServer = "$HOME/.local/share/althea/AltServer"
-AnisetteServer = "$HOME/.local/share/althea/anisette-server"
-AltStore = "$HOME/.local/share/althea/AltStore.ipa"
-PATH = AltStore
-AutoStart = resource_path("resources/AutoStart.sh")
 altheapath = os.path.join(
     os.environ.get("XDG_DATA_HOME") or f'{ os.environ["HOME"] }/.local/share',
     "althea",
 )
-export_anisette = "export ALTSERVER_ANISETTE_SERVER='http://127.0.0.1:6969'"
+AltServer = os.path.join(altheapath, "AltServer")
+AnisetteServer = os.path.join(altheapath, "anisette-server")
+AltStore = os.path.join(altheapath, "AltStore.ipa")
+INSTALL_PATH = AltStore
+AutoStart = resource_path("resources/AutoStart.sh")
+indicator = None
 
 # Check version
 with open(resource_path("resources/version"), "r", encoding="utf-8") as f:
     LocalVersion = f.readline().strip()
 
-# Functions
-def connectioncheck():
+
+def anisette_env():
+    # Keep the anisette endpoint in one place so every spawned helper gets the same value
+    env = os.environ.copy()
+    env["ALTSERVER_ANISETTE_SERVER"] = ANISETTE_SERVER_URL
+    return env
+
+
+def anisette_server_ready():
+    # A short local probe is enough here because anisette should only be bound on localhost
     try:
-        urlopen("http://www.example.com", timeout=5)
-        return True
-    except:
+        with urlopen(ANISETTE_SERVER_URL, timeout=2) as response:
+            return response.read(1) == b"{"
+    except OSError:
         return False
 
+
+def should_use_tray():
+    # Update //fork change! Skip tray mode on Hyprland because the tray popup path is crashing the compositor
+    # Env flags keep the old behavior reachable for debugging without editing the file again
+    if os.environ.get("ALTHEA_DISABLE_TRAY") == "1":
+        return False
+    if os.environ.get("ALTHEA_ENABLE_TRAY") == "1":
+        return True
+    return "Hyprland" not in os.environ.get("XDG_CURRENT_DESKTOP", "")
+
+
+def kill_process_by_path(path):
+    # Match by full path so unrelated processes with the same short name stay untouched
+    subprocess.run(["pkill", "-f", path], check=False)
+
+
+def terminate_althea_services():
+    kill_process_by_path(AltServer)
+    kill_process_by_path(AnisetteServer)
+
+
+def download_to_file(url, destination):
+    # Stream downloads to disk so large IPA and APK files do not sit in memory all at once
+    with requests.get(url, stream=True, timeout=(10, 180)) as response:
+        response.raise_for_status()
+        with open(destination, "wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+
+
+def read_log_text():
+    # The installer writes progress to a plain log file, so the UI can poll one source of truth
+    log_path = os.path.join(altheapath, "log.txt")
+    if not os.path.exists(log_path):
+        return ""
+    with open(log_path, "r", encoding="utf-8", errors="replace") as file:
+        return file.read()
+
+
+def tail_lines(text, count):
+    # Dialogs only need the latest lines, not the whole log
+    lines = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-count:])
+
+# Functions
+def connectioncheck():
+    # A simple socket probe avoids blocking startup on HTTP redirects or CDN quirks
+    probes = [("1.1.1.1", 53), ("8.8.8.8", 53)]
+    for host, port in probes:
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def app_commands():
+    # Keep the primary actions in one list so tray and window mode stay in sync
+    return [
+        ("About althea", on_abtdlg),
+        ("Install AltStore", altstoreinstall),
+        ("Install an IPA file", altserverfile),
+        ("Pair", lambda x: openwindow(PairWindow)),
+        ("Restart AltServer", restart_altserver),
+        ("Quit althea", lambda x: quitit()),
+    ]
+
 def menu():
+    # Build the tray menu from the shared command list
     menu = Gtk.Menu()
 
     if notify():
@@ -100,31 +172,18 @@ def menu():
 
         menu.append(Gtk.SeparatorMenuItem())
 
-    commands = [
-        ("About althea", on_abtdlg),
-        #("Settings", lambda x: openwindow(SettingsWindow)),
-        ("Install AltStore", altstoreinstall),
-        ("Install an IPA file", altserverfile),
-        ("Pair", lambda x: openwindow(PairWindow)),
-        ("Restart AltServer", restart_altserver),
-        ("Quit althea", lambda x: quitit())
-    ]
-
-    for label, callback in commands:
+    for label, callback in app_commands():
         command = Gtk.MenuItem(label=label)
         command.connect("activate", callback)
         menu.append(command)
         if label == "Settings":
             menu.append(Gtk.SeparatorMenuItem())
 
-    CheckRun11 = subprocess.run(f"test -e /usr/lib/althea/althea", shell=True)
     if installedcheck:
         global command_six
-        CheckRun12 = subprocess.run(
-            f"test -e $HOME/.config/autostart/althea.desktop", shell=True
-        )
-        if CheckRun12.returncode == 0:
-            command_six.set_active(command_six)
+        # Read the desktop entry directly instead of shelling out to test
+        if os.path.exists(os.path.expanduser("~/.config/autostart/althea.desktop")):
+            command_six.set_active(True)
         command_six.connect("activate", launchatlogin1)
         menu.append(Gtk.SeparatorMenuItem())
         menu.append(command_six)
@@ -161,11 +220,15 @@ def on_abtdlg(self):
     about.destroy()
 
 def paircheck():  # Check if the device is paired already
-    pairchecking = subprocess.run('idevicepair validate | grep -q "SUCCESS"', shell=True) # use validate instaed of pair, pair causes error -5 if already paired
-    if pairchecking.returncode == 0:
-        return False
-    else:
-        return True
+    # Ask idevicepair directly and read its output instead of parsing a shell pipeline
+    pairchecking = subprocess.run(
+        ["idevicepair", "validate"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )  # use validate instead of pair, pair causes error -5 if already paired
+    output = f"{pairchecking.stdout}\n{pairchecking.stderr}"
+    return "SUCCESS" not in output
 
 def altstoreinstall(_):
     if version.parse(ios_version()) < version.parse("15.0"):
@@ -197,24 +260,28 @@ def altserverfile(_):
     else:
         win2 = FileChooserWindow()
         global ipa_path_exists
-        if ipa_path_exists == True:
-            global PATH
-            PATH = win2.PATHFILE
+        if ipa_path_exists:
+            global INSTALL_PATH
+            INSTALL_PATH = win2.PATHFILE
             win1()
             ipa_path_exists = False
 
 def notify():
-    if (connectioncheck()) == True:
+    # Update checks should never block the app from opening
+    if not connectioncheck():
+        return False
+    try:
         LatestVersion = (
             urllib.request.urlopen(
-                "https://raw.githubusercontent.com/vyvir/althea/main/resources/version"
+                "https://raw.githubusercontent.com/vyvir/althea/main/resources/version",
+                timeout=5,
             )
             .readline()
             .rstrip()
             .decode()
         )
-        if LatestVersion > LocalVersion:
-            Notify.init("MyProgram")
+        if version.parse(LatestVersion) > version.parse(LocalVersion):
+            Notify.init(APP_NAME)
             n = Notify.Notification.new(
                 "An update is available!",
                 "Click 'Download Update' in the tray menu.",
@@ -224,10 +291,9 @@ def notify():
             # n.add_action("newupd", "Download", actionCallback)
             n.show()
             return True
-        else:
-            return False
-    else:
+    except Exception:
         return False
+    return False
 
 def showurl(_):
     Gtk.show_uri_on_window(
@@ -240,18 +306,21 @@ def openwindow(window):
     w.show_all()
 
 def quitit():
-    subprocess.run(f"killall {AltServer}", shell=True)
-    subprocess.run(f"killall {AnisetteServer}", shell=True)
+    # Stop helper daemons before the GTK loop is torn down
+    terminate_althea_services()
     Gtk.main_quit()
     os.kill(os.getpid(), signal.SIGKILL)
 
 def restart_altserver(_):
-    subprocess.run(f"killall {AltServer}", shell=True)
-    subprocess.run(f"killall {AnisetteServer}", shell=True)
-    subprocess.run("idevicepair pair", shell=True)
-    subprocess.run(
-        f"""{export_anisette} ; {(altheapath)}/AltServer &""",
-        shell=True,
+    # Restart the helper pair with the same clean env used during startup
+    terminate_althea_services()
+    subprocess.run(["idevicepair", "pair"], check=False)
+    subprocess.Popen(
+        [AltServer],
+        env=anisette_env(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
 
 def use_saved_credentials():
@@ -305,14 +374,14 @@ def actionCallback(notification, action, user_data=None):
     )
     quitit()
 
-def launchatlogin1(_):
-    global command_six
-    if command_six.get_active():
-        global AutoStart
-        os.popen(AutoStart).read()
+def launchatlogin1(widget):
+    # The same handler is used by both menu and window toggles
+    active_widget = widget if hasattr(widget, "get_active") else command_six
+    if active_widget.get_active():
+        subprocess.run([AutoStart], check=False)
         return True
     else:
-        silent_remove("$HOME/.config/autostart/althea.desktop")
+        silent_remove(os.path.expanduser("~/.config/autostart/althea.desktop"))
         return False
 
 def silent_remove(filename):
@@ -327,7 +396,7 @@ def altstore_download(value):
     baseUrl = "https://cdn.altstore.io/file/altstore/apps.json"
 
     # retrieving data from JSON Data
-    json_data = requests.get(baseUrl)
+    json_data = requests.get(baseUrl, timeout=(10, 60))
     if json_data.status_code == 200:
         data = json_data.json()
         for app in data['apps']:
@@ -335,38 +404,32 @@ def altstore_download(value):
                 if value == "Check":
                     size = app['versions'][0]['size']
                     return size == os.path.getsize(f'{(altheapath)}/AltStore.ipa')
-                    break
                 if value == "Download":
                     latest = app['versions'][0]['downloadURL']
-                    r = requests.get(
-                        latest,
-                        allow_redirects=True,
-                    )
                     latest_filename = latest.split('/')[-1]
-                    open(f"{(altheapath)}/{(latest_filename)}", "wb").write(r.content)
+                    # Save to a temp name first so a partial download never replaces the working IPA
+                    download_to_file(latest, f"{(altheapath)}/{(latest_filename)}")
                     os.rename(f"{(altheapath)}/{(latest_filename)}", f"{(altheapath)}/AltStore.ipa")
-                    subprocess.run(f"chmod 755 {(altheapath)}/AltStore.ipa", shell=True)
-                    break
+                    os.chmod(f"{(altheapath)}/AltStore.ipa", 0o755)
+                break
         return True
     else:
         return False
 
 def ios_version():
-    silent_remove(f"{(altheapath)}/ideviceinfo.txt")
-    subprocess.run(f"ideviceinfo > {(altheapath)}/ideviceinfo.txt", shell=True)
-    result = "result"
-    pathsy = f"{(altheapath)}/ideviceinfo.txt"
-    with open(pathsy) as file:
-        # Iterate through lines
-        for line in file.readlines():
-            # Find the start of the word
-            index = line.find("ProductVersion: ")
-            # If the word is inside the line
-            if index != -1:
-                result = line[:-1][16:]
-    silent_remove(f"{(altheapath)}/ideviceinfo.txt")
-    print(result)
-    return(result)
+    # Read the device version from stdout so no temporary file is needed
+    result = subprocess.run(
+        ["ideviceinfo"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("ProductVersion: "):
+            detected_version = line.split(": ", 1)[1].strip()
+            print(detected_version)
+            return detected_version
+    return "0"
 
 # Classes
 class SplashScreen(Handy.Window):
@@ -400,106 +463,193 @@ class SplashScreen(Handy.Window):
         self.mainBox.pack_start(self.lbl1, False, False, 6)
         self.loadalthea = Gtk.ProgressBar()
         self.mainBox.pack_start(self.loadalthea, True, True, 0)
-        self.t = threading.Thread(target=self.startup_process)
+        # Update //fork change! Startup work runs off the GTK thread and only feeds progress back through idle callbacks
+        self.t = threading.Thread(target=self.startup_process, daemon=True)
         self.t.start()
         self.wait_for_t(self.t)
 
     def wait_for_t(self, t):
         if not self.t.is_alive():
             global indicator
-            indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+            if indicator is not None:
+                indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
             self.t.join()
             self.destroy()
+            # In window mode the splash hands off to the main control window instead of a tray icon
+            if indicator is None:
+                openwindow(MainWindow)
         else:
             GLib.timeout_add(200, self.wait_for_t, self.t)
 
+    def set_status_text(self, text):
+        # GTK widgets must be touched from the main loop
+        GLib.idle_add(self.lbl1.set_text, text)
+
+    def set_progress(self, fraction):
+        # GTK widgets must be touched from the main loop
+        GLib.idle_add(self.loadalthea.set_fraction, fraction)
+
     def download_bin(self, name, link):
+        # Pick the matching binary once and feed the same download helper for every arch
         match computer_cpu_platform:
             case 'x86_64':
-                r = requests.get(
-                    f"{link}-x86_64",
-                    allow_redirects=True,
-                )
+                url = f"{link}-x86_64"
             case 'aarch64':
-                r = requests.get(
-                    f"{link}-aarch64",
-                    allow_redirects=True
-                )
+                url = f"{link}-aarch64"
             case _:
                 if computer_cpu_platform.find('v7') != -1 \
                     or computer_cpu_platform.find('ARM') != -1 \
                         or computer_cpu_platform.find('hf') != -1:
-                            r = requests.get(
-                                f"{link}-armv7",
-                                allow_redirects=True
-                            )
+                            url = f"{link}-armv7"
                 else:
-                    self.lbl1.set_text('Could not identify the CPU architecture, downloading the x86_64 version...')
-                    r = requests.get(
-                        f"{link}-x86_64",
-                        allow_redirects=True,
-                    )
-        open(f"{(altheapath)}/{name}", "wb").write(r.content)
-        subprocess.run(f"chmod +x {(altheapath)}/{name}", shell=True)
-        subprocess.run(f"chmod 755 {(altheapath)}/{name}", shell=True)
+                    self.set_status_text('Could not identify the CPU architecture, downloading the x86_64 version...')
+                    url = f"{link}-x86_64"
+        download_to_file(url, f"{(altheapath)}/{name}")
+        os.chmod(f"{(altheapath)}/{name}", 0o755)
 
     
     def startup_process(self):
-        self.lbl1.set_text("Checking if anisette-server is already running...")
-        self.loadalthea.set_fraction(0.1)
-        command = 'curl 127.0.0.1:6969 | grep -q "{"'
-        CheckRun = subprocess.run(command, shell=True)
+        # Update //fork change! Startup now uses direct subprocess calls and streamed downloads instead of shell-built commands
+        self.set_status_text("Checking if anisette-server is already running...")
+        self.set_progress(0.1)
         if not os.path.isfile(f"{(altheapath)}/anisette-server"):
-            self.lbl1.set_text("Downloading anisette-server...")
+            self.set_status_text("Downloading anisette-server...")
             self.download_bin("anisette-server", "https://github.com/vyvir/althea/releases/download/v0.5.0/anisette-server")
-            self.loadalthea.set_fraction(0.2)
-            self.lbl1.set_text("Downloading Apple Music APK...")
-            r = requests.get(
+            self.set_progress(0.2)
+            self.set_status_text("Downloading Apple Music APK...")
+            download_to_file(
                 "https://apps.mzstatic.com/content/android-apple-music-apk/applemusic.apk",
-                allow_redirects=True,
+                f"{(altheapath)}/am.apk",
             )
-            open(f"{(altheapath)}/am.apk", "wb").write(r.content)
-            os.makedirs(f"{(altheapath)}/lib/x86_64")
-            self.loadalthea.set_fraction(0.3)
-            self.lbl1.set_text("Extracting necessary libraries...")
-            CheckRunB = subprocess.run(
-                f'unzip -j "{(altheapath)}/am.apk" "lib/x86_64/libstoreservicescore.so" -d "{(altheapath)}/lib/x86_64"',
-                shell=True,
+            os.makedirs(f"{(altheapath)}/lib/x86_64", exist_ok=True)
+            self.set_progress(0.3)
+            self.set_status_text("Extracting necessary libraries...")
+            subprocess.run(
+                [
+                    "unzip",
+                    "-j",
+                    f"{(altheapath)}/am.apk",
+                    "lib/x86_64/libstoreservicescore.so",
+                    "-d",
+                    f"{(altheapath)}/lib/x86_64",
+                ],
+                check=False,
             )
-            CheckRunC = subprocess.run(
-                f'unzip -j "{(altheapath)}/am.apk" "lib/x86_64/libCoreADI.so" -d "{(altheapath)}/lib/x86_64"',
-                shell=True,
+            subprocess.run(
+                [
+                    "unzip",
+                    "-j",
+                    f"{(altheapath)}/am.apk",
+                    "lib/x86_64/libCoreADI.so",
+                    "-d",
+                    f"{(altheapath)}/lib/x86_64",
+                ],
+                check=False,
             )
             silent_remove(f"{(altheapath)}/am.apk")
-            self.loadalthea.set_fraction(0.4)
-        self.lbl1.set_text("Starting anisette-server...")
-        subprocess.run(f"{(altheapath)}/anisette-server -n 127.0.0.1 -p 6969 &", shell=True)
-        #subprocess.run(f"cd {(altheapath)} && ./anisette-server &", shell=True)#-n 127.0.0.1 -p 6969 &", shell=True
-        self.loadalthea.set_fraction(0.5)
+            self.set_progress(0.4)
+        self.set_status_text("Starting anisette-server...")
+        subprocess.Popen(
+            [AnisetteServer, "-n", "127.0.0.1", "-p", "6969"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.set_progress(0.5)
         finished = False
         while not finished:
-            CheckRun5 = subprocess.run(command, shell=True)
-            if CheckRun5.returncode == 0:
+            # Wait until anisette is actually answering before AltServer is started
+            if anisette_server_ready():
                 finished = True
             else:
                 sleep(1)
         if not os.path.isfile(f"{(altheapath)}/AltServer"):
             self.download_bin("AltServer", "https://github.com/NyaMisty/AltServer-Linux/releases/download/v0.0.5/AltServer")
-            self.lbl1.set_text("Downloading AltServer...")
-            self.loadalthea.set_fraction(0.6)
-        self.loadalthea.set_fraction(0.8)
+            self.set_status_text("Downloading AltServer...")
+            self.set_progress(0.6)
+        self.set_progress(0.8)
         if not os.path.isfile(f"{(altheapath)}/AltStore.ipa"):
-            self.lbl1.set_text("Downloading AltStore...")
+            self.set_status_text("Downloading AltStore...")
             altstore_download("Download")
         else:
-            self.lbl1.set_text("Checking latest AltStore version...")
+            self.set_status_text("Checking latest AltStore version...")
             if not altstore_download("Check"):
-                self.lbl1.set_text("Downloading new version of AltStore...")
+                self.set_status_text("Downloading new version of AltStore...")
                 altstore_download("Download")
-        self.lbl1.set_text("Starting AltServer...")
-        self.loadalthea.set_fraction(1.0)
-        subprocess.run(f"{export_anisette} ; {(altheapath)}/AltServer &", shell=True)
+        self.set_status_text("Starting AltServer...")
+        self.set_progress(1.0)
+        subprocess.Popen(
+            [AltServer],
+            env=anisette_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
         return 0
+
+
+class MainWindow(Handy.Window):
+    def __init__(self):
+        super().__init__(title="althea")
+        self.present()
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_resizable(False)
+        self.set_border_width(16)
+        self.set_default_size(420, 360)
+
+        handle = Handy.WindowHandle()
+        self.add(handle)
+
+        outer = Gtk.Box(spacing=12, orientation=Gtk.Orientation.VERTICAL)
+        handle.add(outer)
+
+        header = Handy.HeaderBar()
+        header.set_show_close_button(True)
+        header.props.title = "althea"
+        outer.pack_start(header, False, True, 0)
+
+        body = Gtk.Box(spacing=10, orientation=Gtk.Orientation.VERTICAL)
+        body.set_margin_top(8)
+        outer.pack_start(body, True, True, 0)
+
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+            resource_path("resources/3.png"), 72, 72
+        )
+        image = Gtk.Image.new_from_pixbuf(pixbuf)
+        body.pack_start(image, False, False, 0)
+
+        title = Gtk.Label(label="althea controls")
+        title.set_justify(Gtk.Justification.CENTER)
+        body.pack_start(title, False, False, 0)
+
+        # Update //fork change! This window replaces the tray workflow on Hyprland so popup menus stop taking down the compositor
+        subtitle = Gtk.Label(
+            label="Tray integration is disabled on Hyprland to avoid a repeated compositor crash."
+        )
+        subtitle.set_line_wrap(True)
+        subtitle.set_max_width_chars(42)
+        subtitle.set_justify(Gtk.Justification.CENTER)
+        body.pack_start(subtitle, False, False, 0)
+
+        for label, callback in app_commands():
+            button = Gtk.Button(label=label)
+            button.connect("clicked", callback)
+            body.pack_start(button, False, False, 0)
+
+        if installedcheck:
+            launch_at_login = Gtk.CheckButton(label="Launch at Login")
+            launch_at_login.set_active(
+                os.path.exists(os.path.expanduser("~/.config/autostart/althea.desktop"))
+            )
+            launch_at_login.connect("toggled", launchatlogin1)
+            body.pack_start(launch_at_login, False, False, 0)
+
+        self.connect("destroy", self.on_destroy)
+        self.show_all()
+
+    def on_destroy(self, widget):
+        # Window mode has no tray fallback on Hyprland, so closing the main window should fully quit
+        quitit()
 
 
 class Login(Gtk.Window):
@@ -537,11 +687,16 @@ class Login(Gtk.Window):
         grid.attach_next_to(self.button, self.entry, Gtk.PositionType.RIGHT, 1, 1)
 
         silent_remove(f"{(altheapath)}/log.txt")
+        self.install_monitor_id = None
+        self.install_warn_seen = False
+        self.install_two_factor_seen = False
+        self.installing = False
 
     def on_click_me_clicked1(self):
-        self.realthread1 = threading.Thread(target=self.onclickmethread)
+        # Saved credentials follow the same worker path as a manual login
+        self.realthread1 = threading.Thread(target=self.onclickmethread, daemon=True)
         self.realthread1.start()
-        GLib.idle_add(self.install_process)
+        self.start_install_monitor()
 
     def on_click_me_clicked(self, button):
         silent_remove(f"{(altheapath)}/log.txt")
@@ -571,124 +726,140 @@ class Login(Gtk.Window):
         self.entry.set_editable(False)
         self.entry1.set_editable(False)
         self.button.set_sensitive(False)
-        self.realthread1 = threading.Thread(target=self.onclickmethread)
+        self.realthread1 = threading.Thread(target=self.onclickmethread, daemon=True)
         self.realthread1.start()
-        GLib.idle_add(self.install_process)
+        self.start_install_monitor()
+
+    def start_install_monitor(self):
+        # Update //fork change! Install state is polled by a GTK timer so the main loop stays responsive
+        self.installing = True
+        self.install_warn_seen = False
+        self.install_two_factor_seen = False
+        if self.install_monitor_id is None:
+            self.install_monitor_id = GLib.timeout_add(300, self.install_process)
 
     def onclickmethread(self):
-        if ios_version() >= "15.0":
+        # The worker only does device and process work, leaving dialogs to the main loop
+        if version.parse(ios_version()) >= version.parse("15.0"):
             global savedcheck
             global apple_id
             global password
             if not savedcheck:
                 apple_id = self.entry1.get_text().lower()
                 password = self.entry.get_text()
-            UDID = subprocess.check_output("idevice_id -l", shell=True).decode().strip()
+            UDID = subprocess.check_output(["idevice_id", "-l"]).decode().strip()
             global InsAltStore
-            print(PATH)
+            print(INSTALL_PATH)
             silent_remove(f"{(altheapath)}/log.txt")
-            #f = open(f"{(altheapath)}/log.txt", "w")
-            #f.close()
             if os.path.isdir(f'{ os.environ["HOME"] }/.adi'):
                 rmtree(f'{ os.environ["HOME"] }/.adi')
-            InsAltStoreCMD = f"""{export_anisette} ; {(AltServer)} -u {UDID} -a {apple_id} -p \"{password}\" {PATH} > {("$HOME/.local/share/althea/log.txt")}"""
-            InsAltStore = subprocess.Popen(
-                InsAltStoreCMD,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                shell=True,
-            )
+            with open(f"{(altheapath)}/log.txt", "w", encoding="utf-8") as log_file:
+                # Update //fork change! Install commands are passed as argv so Apple ID, password, and IPA path do not go through a shell
+                InsAltStore = subprocess.Popen(
+                    [AltServer, "-u", UDID, "-a", apple_id, "-p", password, INSTALL_PATH],
+                    stdin=subprocess.PIPE,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env=anisette_env(),
+                    text=False,
+                )
         else:
             global Failmsg
             Failmsg = "iOS 15.0 or later is required."
+            GLib.idle_add(self.show_fail_and_close)
+
+    def show_fail_and_close(self):
+        # Keep failure dialogs on the GTK thread
+        dialog2 = FailDialog(self)
+        dialog2.run()
+        dialog2.destroy()
+        self.destroy()
+        return False
+
+    def install_process(self):
+        global Failmsg
+        global InsAltStore
+        # The log file is the single source of truth for prompts and failure text
+        log_text = read_log_text()
+        if not self.realthread1.is_alive() and not log_text and InsAltStore.poll() is not None:
+            self.installing = False
+            self.install_monitor_id = None
+            return False
+
+        if "Could not" in log_text:
+            InsAltStore.terminate()
+            self.installing = False
+            self.install_monitor_id = None
+            Failmsg = tail_lines(log_text, 6)
             dialog2 = FailDialog(self)
             dialog2.run()
             dialog2.destroy()
             self.destroy()
+            return False
 
-    def install_process(self):
-        Installing = True
-        WarnTime = 0
-        TwoFactorTime = 0
-        global InsAltStore
-        while Installing:
-            CheckIns = subprocess.run(
-                f'grep -F "Could not" {(altheapath)}/log.txt', shell=True
-            )
-            CheckWarn = subprocess.run(
-                f'grep -F "Are you sure you want to continue?" {(altheapath)}/log.txt',
-                shell=True,
-            )
-            CheckSuccess = subprocess.run(
-                f'grep -F "Notify: Installation Succeeded" {(altheapath)}/log.txt',
-                shell=True,
-            )
-            Check2fa = subprocess.run(
-                f'grep -F "Enter two factor code" {(altheapath)}/log.txt', shell=True
-            )
-            if CheckIns.returncode == 0:
+        if "Are you sure you want to continue?" in log_text and not self.install_warn_seen:
+            self.install_warn_seen = True
+            global Warnmsg
+            Warnmsg = tail_lines(log_text, 8)
+            dialog1 = WarningDialog(self)
+            response1 = dialog1.run()
+            dialog1.destroy()
+            if response1 == Gtk.ResponseType.OK:
+                if InsAltStore.stdin is not None:
+                    # Feed the warning prompt without blocking on communicate
+                    InsAltStore.stdin.write(b"\n")
+                    InsAltStore.stdin.flush()
+            else:
+                subprocess.run(["pkill", "-TERM", "-P", str(InsAltStore.pid)], check=False)
                 InsAltStore.terminate()
-                Installing = False
-                global Failmsg
-                Failmsg = subprocess.check_output(
-                    f"tail -6 {(altheapath)}/log.txt", shell=True
-                ).decode()
-                dialog2 = FailDialog(self)
-                dialog2.run()
-                dialog2.destroy()
+                self.cancel()
                 self.destroy()
-            elif CheckWarn.returncode == 0 and WarnTime == 0:
-                Installing = False
-                word = "Are you sure you want to continue?"
-                # This fixes an issue where the warn window appears when it shouldn't
-                with open(f"{(altheapath)}/log.txt", "r") as file:
-                    # Read all content of the file
-                    content = file.read()
-                    # Check if a string present in the file
-                    if word in content:
-                        global Warnmsg
-                        Warnmsg = subprocess.check_output(
-                            f"tail -8 {('$HOME/.local/share/althea/log.txt')}",
-                            shell=True,
-                        ).decode()
-                        dialog1 = WarningDialog(self)
-                        response1 = dialog1.run()
-                        if response1 == Gtk.ResponseType.OK:
-                            dialog1.destroy()
-                            InsAltStore.communicate(input=b"\n")
-                            WarnTime = 1
-                            Installing = True
-                        elif response1 == Gtk.ResponseType.CANCEL:
-                            dialog1.destroy()
-                            os.system(f"pkill -TERM -P {InsAltStore.pid}")
-                            self.cancel()
-                    else:
-                        WarnTime = 1
-                        Installing = True
-            elif Check2fa.returncode == 0 and TwoFactorTime == 0:
-                Installing = False
-                dialog = VerificationDialog(self)
-                response = dialog.run()
-                if response == Gtk.ResponseType.OK:
-                    vercode = dialog.entry2.get_text()
-                    vercode = vercode + "\n"
-                    vercodebytes = bytes(vercode.encode())
-                    InsAltStore.communicate(input=vercodebytes)
-                    TwoFactorTime = 1
-                    dialog.destroy()
-                    Installing = True
-                elif response == Gtk.ResponseType.CANCEL:
-                    TwoFactorTime = 1
-                    os.system(f"pkill -TERM -P {InsAltStore.pid}")
-                    self.cancel()
-                    dialog.destroy()
-                    self.destroy()
-            elif CheckSuccess.returncode == 0:
-                Installing = False
-                self.success()
+                self.installing = False
+                self.install_monitor_id = None
+                return False
+
+        if "Enter two factor code" in log_text and not self.install_two_factor_seen:
+            self.install_two_factor_seen = True
+            dialog = VerificationDialog(self)
+            response = dialog.run()
+            if response == Gtk.ResponseType.OK:
+                vercode = f"{dialog.entry2.get_text()}\n".encode()
+                if InsAltStore.stdin is not None:
+                    # Feed the 2FA code the same way as the warning prompt
+                    InsAltStore.stdin.write(vercode)
+                    InsAltStore.stdin.flush()
+            else:
+                subprocess.run(["pkill", "-TERM", "-P", str(InsAltStore.pid)], check=False)
+                InsAltStore.terminate()
+                self.cancel()
+                dialog.destroy()
                 self.destroy()
+                self.installing = False
+                self.install_monitor_id = None
+                return False
+            dialog.destroy()
+
+        if "Notify: Installation Succeeded" in log_text:
+            self.installing = False
+            self.install_monitor_id = None
+            self.success()
+            self.destroy()
+            return False
+
+        if not self.realthread1.is_alive() and InsAltStore.poll() not in (None, 0):
+            self.installing = False
+            self.install_monitor_id = None
+            Failmsg = tail_lines(log_text, 10) or "AltServer exited before the install completed."
+            dialog2 = FailDialog(self)
+            dialog2.run()
+            dialog2.destroy()
+            self.destroy()
+            return False
+
+        return True
 
     def success(self):
+        # Keep success feedback short because the heavy work already finished
         dialog = Gtk.MessageDialog(
             transient_for=self,
             flags=0,
@@ -774,12 +945,10 @@ class PairWindow(Handy.Window):
         button.set_property("margin_right", 150)
         self.hbox.pack_start(button, False, False, 10)
 
-        self.add(button)
-        self.add(self.hbox)
-
     def on_info_clicked(self, widget):
+        # The first call nudges the device trust dialog if it is still pending
         try:
-            subprocess.run(["idevicepair pair"], shell=True, check=True)
+            subprocess.run(["idevicepair", "pair"], check=True)
         except subprocess.CalledProcessError as e:
             print(e.output)
             dialog = Gtk.MessageDialog(
@@ -792,20 +961,21 @@ class PairWindow(Handy.Window):
 
             dialog.run()
         try:
+            # The second call confirms pairing and then moves back into the install flow
             subprocess.run(
-                ["idevicepair pair"], shell=True, check=True, capture_output=True
+                ["idevicepair", "pair"], check=True, capture_output=True
             )
             self.destroy()
             global login_or_file_chooser
-            global PATH
+            global INSTALL_PATH
             if login_or_file_chooser == "file_chooser":
                 win2 = FileChooserWindow()
             else:
-                PATH = f"{(altheapath)}/AltStore.ipa"
+                INSTALL_PATH = f"{(altheapath)}/AltStore.ipa"
                 win1()
             global ipa_path_exists
-            if ipa_path_exists == True:
-                PATH = win2.PATHFILE
+            if ipa_path_exists:
+                INSTALL_PATH = win2.PATHFILE
                 win1()
                 ipa_path_exists = False
             login_or_file_chooser = "login"
@@ -822,7 +992,7 @@ class PairWindow(Handy.Window):
             dialog1.destroy()
         try:
             dialog.destroy()
-        except:
+        except NameError:
             pass
 
 
@@ -957,7 +1127,6 @@ class Oops(Handy.Window):
         # WindowHandle
         handle = Handy.WindowHandle()
         self.add(handle)
-        box = Gtk.VBox()
         vb = Gtk.VBox(spacing=0, orientation=Gtk.Orientation.VERTICAL)
 
         # Headerbar
@@ -989,8 +1158,6 @@ class Oops(Handy.Window):
         handle.add(vb)
         vb.pack_start(lbl1, expand=False, fill=True, padding=0)
         vb.pack_start(button, False, False, 10)
-        box.add(vb)
-        self.add(box)
         self.show_all()
 
     def on_info_clicked2(self, widget):
@@ -1008,7 +1175,6 @@ class SettingsWindow(Handy.Window):
         # WindowHandle
         handle = Handy.WindowHandle()
         self.add(handle)
-        box = Gtk.VBox()
         vb = Gtk.VBox(spacing=0, orientation=Gtk.Orientation.VERTICAL)
 
         # Headerbar
@@ -1048,8 +1214,6 @@ class SettingsWindow(Handy.Window):
         vb.pack_start(lbl1, expand=False, fill=True, padding=0)
         vb.pack_start(button, False, False, 10)
         vb.pack_start(button1, False, False, 10)
-        box.add(vb)
-        self.add(box)
         self.show_all()
 
     def on_info_clicked2(self, widget):
@@ -1063,38 +1227,29 @@ class SettingsWindow(Handy.Window):
 
 # Main function
 def main():
-    GLib.set_prgname("althea")  # Sets the global program name
-    global altheapath
-    #global file_name
-    if not os.path.exists(altheapath):  # Creates $HOME/.local/share/althea
-        os.mkdir(altheapath)
-    if Gtk.StatusIcon.is_embedded:
-        if connectioncheck():
-            global indicator
-            indicator = appindicator.Indicator.new(
-                "althea-tray-icon",
-                resource_path("resources/1.png"),
-                appindicator.IndicatorCategory.APPLICATION_STATUS,
-            )
-            indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
-            indicator.set_menu(menu())
-            indicator.set_status(appindicator.IndicatorStatus.PASSIVE)
-            openwindow(SplashScreen)
-        else:
-            markup_text = "althea is unable to connect to the Internet.\nPlease connect to the Internet and restart althea."
-            pixbuf_icon = "network-wireless-no-route-symbolic"
-            Oops(markup_text, pixbuf_icon)  # Notify the user there is no Internet connection
-    else:
-        markup_text = (
-            "You don't have the AppIndicator extension installed.\n"
-            'You can download it on <a href="https://extensions.gnome.org/extension/615/appindicator-support/" '
-            'title="GNOME Extensions">GNOME Extensions</a>.'
-        )
-        pixbuf_icon = "application-x-addon-symbolic"
-        Oops(markup_text, pixbuf_icon)  # Notify the user the tray icons aren't installed
+    GLib.set_prgname(APP_NAME)  # Sets the global program name
     Handy.init()
+    os.makedirs(altheapath, exist_ok=True)
+    global indicator
+    indicator = None
+    # Update //fork change! Tray mode is now opt-in on Hyprland because repeated tray popup clicks were crashing the compositor
+    if should_use_tray():
+        indicator = appindicator.Indicator.new(
+            "althea-tray-icon",
+            resource_path("resources/1.png"),
+            appindicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+        indicator.set_menu(menu())
+        indicator.set_status(appindicator.IndicatorStatus.PASSIVE)
+    openwindow(SplashScreen)
     Gtk.main()
 
 # Call main
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Update //fork change! Foreground terminal cancels now stop helper daemons so source runs do not leak background processes
+        terminate_althea_services()
+        sys.exit(130)
