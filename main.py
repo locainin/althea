@@ -49,18 +49,22 @@ def resource_path(relative_path):
 
 
 # Global variables
-ipa_path_exists = False
-savedcheck = False
-InsAltStore = subprocess.Popen(
+# Install flow state stays grouped here so the shared helpers can switch paths without guessing
+has_selected_install_file = False
+using_saved_credentials = False
+install_subprocess = subprocess.Popen(
     ["test"], stdin=subprocess.PIPE, stdout=subprocess.PIPE
 )
-login_or_file_chooser = "login"
+# Pairing can bounce into either AltStore or a picked IPA, so the pending action is tracked here
+post_pair_action = "altstore"
 apple_id = "lol"
 password = "lol"
-Warnmsg = "warn"
-Failmsg = "fail"
-icon_name = "changes-prevent-symbolic"
-command_six = Gtk.CheckMenuItem(label="Launch at Login")
+# Dialog text is updated by the worker flow and then rendered on the GTK thread
+warning_message = "warn"
+failure_message = "fail"
+# The password entry reuses one icon name so both manual login and saved-login paths stay consistent
+password_toggle_icon_name = "changes-prevent-symbolic"
+launch_at_login_menu_item = Gtk.CheckMenuItem(label="Launch at Login")
 altheapath = os.path.join(
     os.environ.get("XDG_DATA_HOME") or f'{ os.environ["HOME"] }/.local/share',
     "althea",
@@ -68,9 +72,9 @@ altheapath = os.path.join(
 AltServer = os.path.join(altheapath, "AltServer")
 AnisetteServer = os.path.join(altheapath, "anisette-server")
 AltStore = os.path.join(altheapath, "AltStore.ipa")
-INSTALL_PATH = AltStore
+selected_install_path = AltStore
 AutoStart = resource_path("resources/AutoStart.sh")
-indicator = None
+tray_indicator = None
 
 # Check version
 with open(resource_path("resources/version"), "r", encoding="utf-8") as f:
@@ -161,6 +165,46 @@ def app_commands():
         ("Quit althea", lambda x: quitit()),
     ]
 
+
+def open_login_entry():
+    # One entry point keeps saved-login reuse and manual login behavior aligned
+    try:
+        if keyring.get_password("althea", "apple_id"):
+            use_saved_credentials()
+        else:
+            openwindow(Login)
+    except keyring.errors.KeyringError:
+        openwindow(Login)
+
+
+def continue_post_pair_flow():
+    # Pairing and direct launch paths both land here so install-mode branching stays in one place
+    global post_pair_action
+    global selected_install_path
+    global has_selected_install_file
+    if post_pair_action == "file_chooser":
+        # File selection happens after pairing so the chooser is only shown when the device is ready
+        file_chooser_window = FileChooserWindow()
+        if has_selected_install_file:
+            selected_install_path = file_chooser_window.selected_file_path
+            has_selected_install_file = False
+            open_login_entry()
+    else:
+        # AltStore install keeps the default IPA path and goes straight into login
+        selected_install_path = AltStore
+        open_login_entry()
+    post_pair_action = "altstore"
+
+
+def begin_install_flow(install_mode):
+    # Install entry flow decides whether pairing is needed before login or file selection happens
+    global post_pair_action
+    post_pair_action = install_mode
+    if paircheck():
+        openwindow(PairWindow)
+        return
+    continue_post_pair_flow()
+
 def menu():
     # Build the tray menu from the shared command list
     menu = Gtk.Menu()
@@ -176,17 +220,15 @@ def menu():
         command = Gtk.MenuItem(label=label)
         command.connect("activate", callback)
         menu.append(command)
-        if label == "Settings":
-            menu.append(Gtk.SeparatorMenuItem())
 
     if installedcheck:
-        global command_six
+        global launch_at_login_menu_item
         # Read the desktop entry directly instead of shelling out to test
         if os.path.exists(os.path.expanduser("~/.config/autostart/althea.desktop")):
-            command_six.set_active(True)
-        command_six.connect("activate", launchatlogin1)
+            launch_at_login_menu_item.set_active(True)
+        launch_at_login_menu_item.connect("activate", launchatlogin1)
         menu.append(Gtk.SeparatorMenuItem())
-        menu.append(command_six)
+        menu.append(launch_at_login_menu_item)
 
     menu.show_all()
     return menu
@@ -232,39 +274,22 @@ def paircheck():  # Check if the device is paired already
 
 def altstoreinstall(_):
     if version.parse(ios_version()) < version.parse("15.0"):
-        global Warnmsg
-        Warnmsg = f"""\niOS {ios_version()} is not supported by AltStore.\nThe lowest supported version is iOS 15.0.\nYou can still continue, but errors may occur.\n"""
+        global warning_message
+        warning_message = f"""\niOS {ios_version()} is not supported by AltStore.\nThe lowest supported version is iOS 15.0.\nYou can still continue, but errors may occur.\n"""
         ios_dialog = WarningDialog(parent=None)
         ios_dialog.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         ios_response = ios_dialog.run()
         if ios_response == Gtk.ResponseType.OK:
             ios_dialog.destroy()
-            if paircheck():
-                openwindow(PairWindow)
-            else:
-                win1()
+            begin_install_flow("altstore")
         elif ios_response == Gtk.ResponseType.CANCEL:
             ios_dialog.destroy()
     else:
-        if paircheck():
-            openwindow(PairWindow)
-        else:
-            win1()
+        begin_install_flow("altstore")
 
 
 def altserverfile(_):
-    if paircheck():
-        global login_or_file_chooser
-        login_or_file_chooser = "file_chooser"
-        openwindow(PairWindow)
-    else:
-        win2 = FileChooserWindow()
-        global ipa_path_exists
-        if ipa_path_exists:
-            global INSTALL_PATH
-            INSTALL_PATH = win2.PATHFILE
-            win1()
-            ipa_path_exists = False
+    begin_install_flow("file_chooser")
 
 def notify():
     # Update checks should never block the app from opening
@@ -288,7 +313,6 @@ def notify():
                 resource_path("resources/3.png"),
             )
             n.set_timeout(Notify.EXPIRES_DEFAULT)
-            # n.add_action("newupd", "Download", actionCallback)
             n.show()
             return True
     except Exception:
@@ -339,10 +363,9 @@ def use_saved_credentials():
         global password
         apple_id = keyring.get_password("althea", "apple_id")
         password = keyring.get_password("althea", "password")
-        #print(apple_id, password)
-        global savedcheck
-        savedcheck = True
-        Login().on_click_me_clicked1()
+        global using_saved_credentials
+        using_saved_credentials = True
+        Login().start_install_submission()
     else:
         apple_id = keyring.delete_password("althea", "apple_id")
         password = keyring.delete_password("althea", "password")
@@ -350,33 +373,9 @@ def use_saved_credentials():
         win3.show_all()
     dialog.destroy()
 
-def win1():
-    try:
-        if keyring.get_password("althea", "apple_id"):
-            use_saved_credentials()
-        else:
-            openwindow(Login)
-    except keyring.errors.KeyringError:
-        openwindow(Login)
-
-def win2(_):
-    try:
-        if keyring.get_password("althea", "apple_id"):
-            use_saved_credentials()
-        else:
-            openwindow(Login)
-    except keyring.errors.KeyringError:
-        openwindow(Login)
-
-def actionCallback(notification, action, user_data=None):
-    Gtk.show_uri_on_window(
-        None, "https://github.com/vyvir/althea/releases", Gdk.CURRENT_TIME
-    )
-    quitit()
-
 def launchatlogin1(widget):
     # The same handler is used by both menu and window toggles
-    active_widget = widget if hasattr(widget, "get_active") else command_six
+    active_widget = widget if hasattr(widget, "get_active") else launch_at_login_menu_item
     if active_widget.get_active():
         subprocess.run([AutoStart], check=False)
         return True
@@ -470,13 +469,13 @@ class SplashScreen(Handy.Window):
 
     def wait_for_t(self, t):
         if not self.t.is_alive():
-            global indicator
-            if indicator is not None:
-                indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+            global tray_indicator
+            if tray_indicator is not None:
+                tray_indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
             self.t.join()
             self.destroy()
             # In window mode the splash hands off to the main control window instead of a tray icon
-            if indicator is None:
+            if tray_indicator is None:
                 openwindow(MainWindow)
         else:
             GLib.timeout_add(200, self.wait_for_t, self.t)
@@ -673,8 +672,8 @@ class Login(Gtk.Window):
 
         self.entry = Gtk.Entry()
         self.entry.set_visibility(False)
-        global icon_name
-        self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, icon_name)
+        global password_toggle_icon_name
+        self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, password_toggle_icon_name)
         self.entry.connect("icon-press", self.on_icon_toggled)
 
         self.button = Gtk.Button.new_with_label("Login")
@@ -692,10 +691,10 @@ class Login(Gtk.Window):
         self.install_two_factor_seen = False
         self.installing = False
 
-    def on_click_me_clicked1(self):
+    def start_install_submission(self):
         # Saved credentials follow the same worker path as a manual login
-        self.realthread1 = threading.Thread(target=self.onclickmethread, daemon=True)
-        self.realthread1.start()
+        self.install_worker_thread = threading.Thread(target=self.run_install_worker, daemon=True)
+        self.install_worker_thread.start()
         self.start_install_monitor()
 
     def on_click_me_clicked(self, button):
@@ -726,9 +725,7 @@ class Login(Gtk.Window):
         self.entry.set_editable(False)
         self.entry1.set_editable(False)
         self.button.set_sensitive(False)
-        self.realthread1 = threading.Thread(target=self.onclickmethread, daemon=True)
-        self.realthread1.start()
-        self.start_install_monitor()
+        self.start_install_submission()
 
     def start_install_monitor(self):
         # Update //fork change! Install state is polled by a GTK timer so the main loop stays responsive
@@ -738,25 +735,26 @@ class Login(Gtk.Window):
         if self.install_monitor_id is None:
             self.install_monitor_id = GLib.timeout_add(300, self.install_process)
 
-    def onclickmethread(self):
+    def run_install_worker(self):
         # The worker only does device and process work, leaving dialogs to the main loop
         if version.parse(ios_version()) >= version.parse("15.0"):
-            global savedcheck
+            global using_saved_credentials
             global apple_id
             global password
-            if not savedcheck:
+            if not using_saved_credentials:
+                # Manual login stores fresh entry values right before AltServer starts
                 apple_id = self.entry1.get_text().lower()
                 password = self.entry.get_text()
             UDID = subprocess.check_output(["idevice_id", "-l"]).decode().strip()
-            global InsAltStore
-            print(INSTALL_PATH)
+            global install_subprocess
+            print(selected_install_path)
             silent_remove(f"{(altheapath)}/log.txt")
             if os.path.isdir(f'{ os.environ["HOME"] }/.adi'):
                 rmtree(f'{ os.environ["HOME"] }/.adi')
             with open(f"{(altheapath)}/log.txt", "w", encoding="utf-8") as log_file:
                 # Update //fork change! Install commands are passed as argv so Apple ID, password, and IPA path do not go through a shell
-                InsAltStore = subprocess.Popen(
-                    [AltServer, "-u", UDID, "-a", apple_id, "-p", password, INSTALL_PATH],
+                install_subprocess = subprocess.Popen(
+                    [AltServer, "-u", UDID, "-a", apple_id, "-p", password, selected_install_path],
                     stdin=subprocess.PIPE,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -764,8 +762,8 @@ class Login(Gtk.Window):
                     text=False,
                 )
         else:
-            global Failmsg
-            Failmsg = "iOS 15.0 or later is required."
+            global failure_message
+            failure_message = "iOS 15.0 or later is required."
             GLib.idle_add(self.show_fail_and_close)
 
     def show_fail_and_close(self):
@@ -777,20 +775,20 @@ class Login(Gtk.Window):
         return False
 
     def install_process(self):
-        global Failmsg
-        global InsAltStore
+        global failure_message
+        global install_subprocess
         # The log file is the single source of truth for prompts and failure text
         log_text = read_log_text()
-        if not self.realthread1.is_alive() and not log_text and InsAltStore.poll() is not None:
+        if not self.install_worker_thread.is_alive() and not log_text and install_subprocess.poll() is not None:
             self.installing = False
             self.install_monitor_id = None
             return False
 
         if "Could not" in log_text:
-            InsAltStore.terminate()
+            install_subprocess.terminate()
             self.installing = False
             self.install_monitor_id = None
-            Failmsg = tail_lines(log_text, 6)
+            failure_message = tail_lines(log_text, 6)
             dialog2 = FailDialog(self)
             dialog2.run()
             dialog2.destroy()
@@ -799,19 +797,19 @@ class Login(Gtk.Window):
 
         if "Are you sure you want to continue?" in log_text and not self.install_warn_seen:
             self.install_warn_seen = True
-            global Warnmsg
-            Warnmsg = tail_lines(log_text, 8)
+            global warning_message
+            warning_message = tail_lines(log_text, 8)
             dialog1 = WarningDialog(self)
             response1 = dialog1.run()
             dialog1.destroy()
             if response1 == Gtk.ResponseType.OK:
-                if InsAltStore.stdin is not None:
+                if install_subprocess.stdin is not None:
                     # Feed the warning prompt without blocking on communicate
-                    InsAltStore.stdin.write(b"\n")
-                    InsAltStore.stdin.flush()
+                    install_subprocess.stdin.write(b"\n")
+                    install_subprocess.stdin.flush()
             else:
-                subprocess.run(["pkill", "-TERM", "-P", str(InsAltStore.pid)], check=False)
-                InsAltStore.terminate()
+                subprocess.run(["pkill", "-TERM", "-P", str(install_subprocess.pid)], check=False)
+                install_subprocess.terminate()
                 self.cancel()
                 self.destroy()
                 self.installing = False
@@ -824,13 +822,13 @@ class Login(Gtk.Window):
             response = dialog.run()
             if response == Gtk.ResponseType.OK:
                 vercode = f"{dialog.entry2.get_text()}\n".encode()
-                if InsAltStore.stdin is not None:
+                if install_subprocess.stdin is not None:
                     # Feed the 2FA code the same way as the warning prompt
-                    InsAltStore.stdin.write(vercode)
-                    InsAltStore.stdin.flush()
+                    install_subprocess.stdin.write(vercode)
+                    install_subprocess.stdin.flush()
             else:
-                subprocess.run(["pkill", "-TERM", "-P", str(InsAltStore.pid)], check=False)
-                InsAltStore.terminate()
+                subprocess.run(["pkill", "-TERM", "-P", str(install_subprocess.pid)], check=False)
+                install_subprocess.terminate()
                 self.cancel()
                 dialog.destroy()
                 self.destroy()
@@ -846,10 +844,10 @@ class Login(Gtk.Window):
             self.destroy()
             return False
 
-        if not self.realthread1.is_alive() and InsAltStore.poll() not in (None, 0):
+        if not self.install_worker_thread.is_alive() and install_subprocess.poll() not in (None, 0):
             self.installing = False
             self.install_monitor_id = None
-            Failmsg = tail_lines(log_text, 10) or "AltServer exited before the install completed."
+            failure_message = tail_lines(log_text, 10) or "AltServer exited before the install completed."
             dialog2 = FailDialog(self)
             dialog2.run()
             dialog2.destroy()
@@ -889,14 +887,14 @@ class Login(Gtk.Window):
         return True
 
     def on_icon_toggled(self, widget, icon, event):
-        global icon_name
-        if icon_name == "changes-prevent-symbolic":
-            icon_name = "changes-allow-symbolic"
+        global password_toggle_icon_name
+        if password_toggle_icon_name == "changes-prevent-symbolic":
+            password_toggle_icon_name = "changes-allow-symbolic"
             self.entry.set_visibility(True)
-        elif icon_name == "changes-allow-symbolic":
-            icon_name = "changes-prevent-symbolic"
+        elif password_toggle_icon_name == "changes-allow-symbolic":
+            password_toggle_icon_name = "changes-prevent-symbolic"
             self.entry.set_visibility(False)
-        self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, icon_name)
+        self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, password_toggle_icon_name)
 
     #
     #def on_editable_toggled(self, widget):
@@ -966,19 +964,7 @@ class PairWindow(Handy.Window):
                 ["idevicepair", "pair"], check=True, capture_output=True
             )
             self.destroy()
-            global login_or_file_chooser
-            global INSTALL_PATH
-            if login_or_file_chooser == "file_chooser":
-                win2 = FileChooserWindow()
-            else:
-                INSTALL_PATH = f"{(altheapath)}/AltStore.ipa"
-                win1()
-            global ipa_path_exists
-            if ipa_path_exists:
-                INSTALL_PATH = win2.PATHFILE
-                win1()
-                ipa_path_exists = False
-            login_or_file_chooser = "login"
+            continue_post_pair_flow()
         except subprocess.CalledProcessError as e:
             errormsg = e.output.decode("utf-8")
             dialog1 = Gtk.MessageDialog(
@@ -1016,9 +1002,10 @@ class FileChooserWindow(Gtk.Window):
 
         response = dialog.run()
         if response == Gtk.ResponseType.OK:
-            self.PATHFILE = dialog.get_filename()
-            global ipa_path_exists
-            ipa_path_exists = True
+            # The chooser stores the path once, then the shared post-pair helper picks it up
+            self.selected_file_path = dialog.get_filename()
+            global has_selected_install_file
+            has_selected_install_file = True
         elif response == Gtk.ResponseType.CANCEL:
             self.destroy()
 
@@ -1038,7 +1025,7 @@ class FileChooserWindow(Gtk.Window):
 
 class VerificationDialog(Gtk.Dialog):
     def __init__(self, parent):
-        if not savedcheck:
+        if not using_saved_credentials:
             super().__init__(title="Verification code", transient_for=parent, flags=0)
         else:
             super().__init__(title="Verification code", flags=0)
@@ -1067,7 +1054,7 @@ class VerificationDialog(Gtk.Dialog):
 
 class WarningDialog(Gtk.Dialog):
     def __init__(self, parent):
-        global Warnmsg
+        global warning_message
         super().__init__(title="Warning", transient_for=parent, flags=0)
         self.present()
         self.add_buttons(
@@ -1079,7 +1066,7 @@ class WarningDialog(Gtk.Dialog):
         labelhelp = Gtk.Label(label="Are you sure you want to continue?")
         labelhelp.set_justify(Gtk.Justification.CENTER)
 
-        labelhelp1 = Gtk.Label(label=Warnmsg)
+        labelhelp1 = Gtk.Label(label=warning_message)
         labelhelp1.set_justify(Gtk.Justification.CENTER)
         labelhelp1.set_line_wrap(True)
         labelhelp1.set_max_width_chars(48)
@@ -1093,7 +1080,7 @@ class WarningDialog(Gtk.Dialog):
 
 class FailDialog(Gtk.Dialog):
     def __init__(self, parent):
-        global Failmsg
+        global failure_message
         super().__init__(title="Fail", transient_for=parent, flags=0)
         self.present()
         self.add_buttons(Gtk.STOCK_OK, Gtk.ResponseType.OK)
@@ -1103,7 +1090,7 @@ class FailDialog(Gtk.Dialog):
         labelhelp = Gtk.Label(label="AltServer has failed.")
         labelhelp.set_justify(Gtk.Justification.CENTER)
 
-        labelhelp1 = Gtk.Label(label=Failmsg)
+        labelhelp1 = Gtk.Label(label=failure_message)
         labelhelp1.set_justify(Gtk.Justification.CENTER)
         labelhelp1.set_line_wrap(True)
         labelhelp1.set_max_width_chars(48)
@@ -1163,66 +1150,6 @@ class Oops(Handy.Window):
     def on_info_clicked2(self, widget):
         quitit()
 
-class SettingsWindow(Handy.Window):
-    def __init__(self):
-        super().__init__(title="Settings")
-        self.present()
-        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
-        self.set_resizable(False)
-        #self.set_size_request(450, 100)
-        self.set_border_width(10)
-
-        # WindowHandle
-        handle = Handy.WindowHandle()
-        self.add(handle)
-        vb = Gtk.VBox(spacing=0, orientation=Gtk.Orientation.VERTICAL)
-
-        # Headerbar
-        self.hb = Handy.HeaderBar()
-        self.hb.set_show_close_button(True)
-        self.hb.props.title = "Settings"
-        vb.pack_start(self.hb, False, True, 0)
-
-        pixbuf = Gtk.IconTheme.get_default().load_icon(
-            "emblem-system-symbolic", 48, 0
-        )
-        image = Gtk.Image.new_from_pixbuf(pixbuf)
-        image.show()
-        image.set_margin_top(10)
-        vb.pack_start(image, True, True, 0)
-
-        lbl1 = Gtk.Label()
-        lbl1.set_justify(Gtk.Justification.CENTER)
-        lbl1.set_markup(
-            "These settings are experimental. Use at own risk."
-        )
-        lbl1.set_property("margin_left", 15)
-        lbl1.set_property("margin_right", 15)
-        lbl1.set_margin_top(10)
-
-        button = Gtk.Button(label="OK")
-        button.set_property("margin_left", 125)
-        button.set_property("margin_right", 125)
-        button.connect("clicked", self.on_info_clicked2)
-
-        button1 = Gtk.Button(label="Open PairWindow")
-        button1.set_property("margin_left", 125)
-        button1.set_property("margin_right", 125)
-        button1.connect("clicked", self.on_info_clicked3)
-
-        handle.add(vb)
-        vb.pack_start(lbl1, expand=False, fill=True, padding=0)
-        vb.pack_start(button, False, False, 10)
-        vb.pack_start(button1, False, False, 10)
-        self.show_all()
-
-    def on_info_clicked2(self, widget):
-        self.destroy()
-
-    def on_info_clicked3(self, widget):
-        openwindow(PairWindow)
-
-
 # -----------------------------------------------------------------------------
 
 # Main function
@@ -1230,18 +1157,18 @@ def main():
     GLib.set_prgname(APP_NAME)  # Sets the global program name
     Handy.init()
     os.makedirs(altheapath, exist_ok=True)
-    global indicator
-    indicator = None
+    global tray_indicator
+    tray_indicator = None
     # Update //fork change! Tray mode is now opt-in on Hyprland because repeated tray popup clicks were crashing the compositor
     if should_use_tray():
-        indicator = appindicator.Indicator.new(
+        tray_indicator = appindicator.Indicator.new(
             "althea-tray-icon",
             resource_path("resources/1.png"),
             appindicator.IndicatorCategory.APPLICATION_STATUS,
         )
-        indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
-        indicator.set_menu(menu())
-        indicator.set_status(appindicator.IndicatorStatus.PASSIVE)
+        tray_indicator.set_status(appindicator.IndicatorStatus.ACTIVE)
+        tray_indicator.set_menu(menu())
+        tray_indicator.set_status(appindicator.IndicatorStatus.PASSIVE)
     openwindow(SplashScreen)
     Gtk.main()
 

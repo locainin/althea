@@ -74,6 +74,8 @@ The codebase is also fairly messy in places. There are plans to keep doing clean
 - move sensitive GTK update paths away from worker-thread UI mutation and back onto the main loop
 - improve startup and install flow handling so source runs are less fragile overall
 - add fork-specific comments in the code where larger behavioral changes were introduced
+- tighten runtime state naming and collapse duplicate install-entry logic into shared helpers so the current flow is easier to follow
+- remove stale runtime-only leftovers, including duplicate entry helpers, the unused `actionCallback`, the unused `SettingsWindow`, and the dead tray-menu separator for a non-existent Settings item
 
 ## FAQ
 
