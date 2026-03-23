@@ -53,6 +53,28 @@ python3 main.py
 
 That's it! Have fun with althea!
 
+## Fork Acknowledgment
+
+This fork exists for personal use on a Hyprland setup.
+
+On Hyprland with Waybar, running `python3 main.py` and then interacting with the tray icon was repeatedly triggering a compositor crash path tied to popup creation and input handling. Because of that, this fork changes the Hyprland behavior to avoid relying on the tray popup flow and instead use a regular window-based control surface.
+
+This fork also includes some source-run quality-of-life fixes, such as cleaning up helper processes correctly when canceling a local `python3 main.py` run.
+
+The upstream project is still the main reference point. This fork should be treated as a personal compatibility and maintenance branch if anything at all. 
+
+The codebase is also fairly messy in places. There are plans to keep doing cleanup work, reduce some of the fragile process handling, and improve general maintainability over time as needed just becausse im bored.
+
+### Fork Changes
+
+- disable tray mode on Hyprland by default and use a normal window-based control flow instead
+- keep tray mode available through environment overrides for debugging if needed
+- clean up `Ctrl-C` behavior so local `python3 main.py` runs do not leave `AltServer` or `anisette-server` behind
+- replace a number of shell-built subprocess calls with safer argument-based process execution
+- move sensitive GTK update paths away from worker-thread UI mutation and back onto the main loop
+- improve startup and install flow handling so source runs are less fragile overall
+- add fork-specific comments in the code where larger behavioral changes were introduced
+
 ## FAQ
 
 <b>Fedora 41 shows the following error:</b>
